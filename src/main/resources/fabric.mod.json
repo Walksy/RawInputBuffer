@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"id": "rawinputbuffer",
+	"version": "${version}",
+	"name": "Raw Input Buffer",
+	"description": "Reduces FPS drops and input lag created from mouse polling events",
+	"authors": [
+		"Walksy"
+	],
+	"contact": {
+		"issues": "https://github.com/Walksy/RawInputBuffer/issues",
+		"sources": "https://github.com/Walksy/RawInputBuffer",
+		"homepage": "https://discord.com/invite/zeu7uNuBWY"
+	},
+	"license": "MIT",
+	"icon": "assets/walksy/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"main": [
+			"walksy.rawinput.RawInput"
+		]
+	},
+	"mixins": [
+		"rawinput.mixins.json"
+	],
+	"depends": {
+		"fabricloader": "*",
+		"minecraft": "*",
+		"java": ">=17",
+		"fabric-api": "*",
+		"walksylib": ">=0.9.95"
+	}
+}
