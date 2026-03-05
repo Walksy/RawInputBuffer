@@ -9,6 +9,7 @@ public class RawInput implements ModInitializer {
     @Override
     public void onInitialize() {
         inputHandler = new RawInputHandler();
+
     }
 
     public static RawInputHandler getInputHandler() {

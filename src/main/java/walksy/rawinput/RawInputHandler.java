@@ -1,64 +1,88 @@
 package walksy.rawinput;
 
 import com.sun.jna.Memory;
-import com.sun.jna.platform.win32.User32;
+import com.sun.jna.Native;
+import com.sun.jna.Pointer;
+import com.sun.jna.Structure;
+import com.sun.jna.platform.win32.*;
 import com.sun.jna.platform.win32.WinDef.HWND;
 import com.sun.jna.platform.win32.WinDef.LPARAM;
-import com.sun.jna.platform.win32.WinUser;
+import com.sun.jna.platform.win32.WinDef.LRESULT;
+import com.sun.jna.platform.win32.WinDef.WPARAM;
 import com.sun.jna.platform.win32.WinUser.WNDCLASSEX;
 import com.sun.jna.platform.win32.WinUser.WindowProc;
-import net.minecraft.client.input.MouseInput;
+import com.sun.jna.ptr.IntByReference;
+import com.sun.jna.win32.StdCallLibrary;
+import com.sun.jna.win32.W32APIOptions;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.util.Window;
 import org.apache.logging.log4j.util.TriConsumer;
 import org.lwjgl.glfw.GLFW;
-import walksy.rawinput.windows.User32Ex;
-import walksy.rawinput.windows.Win32;
 
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Handles asynchronous Raw Input from Windows to bypass standard GLFW input latency
- * Runs on a dedicated background thread
- */
 public class RawInputHandler implements AutoCloseable {
     private static final boolean IS_WINDOWS = System.getProperty("os.name").toLowerCase().contains("win");
-    private static final long INPUT_BUFFER_SIZE = 256;
-    private static final byte RAW_INPUT_HEADER_SIZE = 24;
+
+    private static final int WM_INPUT = 0x00FF;
+    private static final int WM_USER = 0x0400;
+    private static final int RID_INPUT = 0x10000003;
+    private static final int RIM_TYPEMOUSE = 0;
+    private static final int RIDEV_INPUTSINK = 0x00000100;
+    private static final int RIDEV_NOLEGACY = 0x00000030;
+    private static final int RIDEV_REMOVE = 0x00000001;
+    private static final int HEADER_SIZE = 8 + (2 * Native.POINTER_SIZE);
+    private static final int FLAGS_OFFSET = HEADER_SIZE;
+    private static final int BUTTON_FLAGS_OFFSET = HEADER_SIZE + 4;
+    private static final int BUTTON_DATA_OFFSET = HEADER_SIZE + 6;
+    private static final int LAST_X_OFFSET = HEADER_SIZE + 12;
+    private static final int LAST_Y_OFFSET = HEADER_SIZE + 16;
+    private static final int INPUT_BUFFER_SIZE = 256;
+    private static final int FOCUS_DELAY = 5;
+    private static final double WHEEL_DELTA_UNIT = 120.0;
+    private static final int MOUSE_MOVE_ABSOLUTE = 0x01;
+    private static final int RI_MOUSE_WHEEL = 0x0400;
+    private static final int[][] BUTTON_MAP = {
+            {0x0001, 0x0002}, {0x0004, 0x0008}, {0x0010, 0x0020}, {0x0040, 0x0080}, {0x0100, 0x0200}
+    };
 
     private final Memory inputBuffer;
-    private final int[] pcbSize = new int[1];
-
-    /**
-     * Using AtomicIntegers prevents thread contention through state locks at high polling rates
-     */
+    private final IntByReference pcbSize;
     private final AtomicInteger deltaX;
     private final AtomicInteger deltaY;
     private final ConcurrentLinkedQueue<Runnable> mainThreadEventQueue;
-
+    private final WindowProc rawInputTargetProc;
     private long glfwWindowHandle;
     private HWND rawInputTargetHwnd;
+    private String windowClassName;
     private TriConsumer<Long, MouseInput, Integer> buttonCallback;
     private TriConsumer<Long, Double, Double> scrollCallback;
+    private int focusTimer;
     private volatile boolean running;
-
-    /** Safe reference to the native Window Procedure callback to prevent Garbage Collection crashes */
-    private final WindowProc rawInputTargetProc = User32.INSTANCE::DefWindowProc;
+    private volatile boolean windowFocused;
+    private volatile boolean gameFocused;
+    private volatile int windowCenterX;
+    private volatile int windowCenterY;
 
     public RawInputHandler() {
         this.deltaX = new AtomicInteger(0);
         this.deltaY = new AtomicInteger(0);
         this.running = false;
+        this.focusTimer = 0;
         this.inputBuffer = new Memory(INPUT_BUFFER_SIZE);
+        this.pcbSize = new IntByReference(INPUT_BUFFER_SIZE);
         this.mainThreadEventQueue = new ConcurrentLinkedQueue<>();
+        this.rawInputTargetProc = new WindowProc() {
+            @Override
+            public LRESULT callback(HWND hwnd, int uMsg, WPARAM wParam, LPARAM lParam) {
+                return User32.INSTANCE.DefWindowProc(hwnd, uMsg, wParam, lParam);
+            }
+        };
+        this.windowFocused = false;
+        this.gameFocused = false;
     }
 
-    /**
-     * Starts the asynchronous input thread and hooks into the Windows Raw Input API
-     * @param windowHandle The GLFW window handle
-     * @param buttonAction Consumer for mouse button events
-     * @param scrollAction Consumer for scroll wheel events
-     * @return true if initialization was successful
-     */
     public boolean initialize(long windowHandle, TriConsumer<Long, MouseInput, Integer> buttonAction, TriConsumer<Long, Double, Double> scrollAction) {
         if (!IS_WINDOWS || this.running) {
             return false;
@@ -68,90 +92,93 @@ public class RawInputHandler implements AutoCloseable {
         this.glfwWindowHandle = windowHandle;
         this.buttonCallback = buttonAction;
         this.scrollCallback = scrollAction;
+        this.windowClassName = "RawInputClass_" + this.glfwWindowHandle;
 
         Thread inputThread = new Thread(this::setupRawInputTarget, "Raw-Input-Buffer-Thread");
         inputThread.setDaemon(true);
         inputThread.start();
+
         return true;
     }
 
-    /**
-     * Registers a hidden window class and starts the Win32 message loop
-     * which allows the mod to receive mouse data without interfering with GLFW
-     */
     private void setupRawInputTarget() {
-        String className = this.glfwWindowHandle + "_";
+        WinDef.HINSTANCE hInstance = Kernel32.INSTANCE.GetModuleHandle(null);
+
         WNDCLASSEX wClass = new WNDCLASSEX();
         wClass.lpfnWndProc = this.rawInputTargetProc;
-        wClass.lpszClassName = className;
+        wClass.lpszClassName = this.windowClassName;
+        wClass.hInstance = hInstance;
+        wClass.cbSize = wClass.size();
         User32.INSTANCE.RegisterClassEx(wClass);
 
         this.rawInputTargetHwnd = User32.INSTANCE.CreateWindowEx(
-                0, className, className + "wnd", 0, 0, 0, 0, 0, null, null, null, null
+                0, this.windowClassName, this.windowClassName + "wnd",
+                0, 0, 0, 0, 0, null, null, hInstance, null
         );
 
-        this.setLegacy(true);
-
+        this.setLegacy(this.windowFocused);
         WinUser.MSG msg = new WinUser.MSG();
-        while (User32.INSTANCE.GetMessage(msg, this.rawInputTargetHwnd, 0, 0) != 0) {
-            if (msg.message == Win32.WM_INPUT) {
+        while (this.running && User32.INSTANCE.GetMessage(msg, null, 0, 0) > 0) {
+            if (msg.message == WM_INPUT) {
                 this.handleRawInput(msg.lParam);
-            } else {
-                User32.INSTANCE.TranslateMessage(msg);
-                User32.INSTANCE.DispatchMessage(msg);
             }
+            User32.INSTANCE.TranslateMessage(msg);
+            User32.INSTANCE.DispatchMessage(msg);
         }
+
+        if (this.rawInputTargetHwnd != null) {
+            User32.INSTANCE.DestroyWindow(this.rawInputTargetHwnd);
+            this.rawInputTargetHwnd = null;
+        }
+        User32.INSTANCE.UnregisterClass(this.windowClassName, hInstance);
     }
 
-    /**
-     * Configures whether Windows should suppress standard mouse messages.
-     * @param exclusive If true, {@code RIDEV_NOLEGACY} is used to kill OS-level cursor processing
-     *                  which reduces CPU usage with high polling rates
-     */
     public void setLegacy(boolean exclusive) {
         if (this.rawInputTargetHwnd == null) return;
 
-        User32Ex.RAWINPUTDEVICE device = new User32Ex.RAWINPUTDEVICE();
-        device.usUsagePage = Win32.HID_USAGE_PAGE_GENERIC;
-        device.usUsage = Win32.HID_USAGE_MOUSE;
-        device.hwndTarget = rawInputTargetHwnd;
-        device.dwFlags = exclusive ? (Win32.RIDEV_INPUTSINK | Win32.RIDEV_NOLEGACY) : Win32.RIDEV_INPUTSINK;
+        User32Ex.RAWINPUTDEVICE[] devices = (User32Ex.RAWINPUTDEVICE[]) new User32Ex.RAWINPUTDEVICE().toArray(1);
+        devices[0].usUsagePage = 0x01;
+        devices[0].usUsage = 0x02;
+        devices[0].hwndTarget = this.rawInputTargetHwnd;
+        devices[0].dwFlags = exclusive ? (RIDEV_INPUTSINK | RIDEV_NOLEGACY) : RIDEV_INPUTSINK;
 
-        device.write();
-        User32Ex.RegisterRawInputDevices(device.getPointer(), 1, device.size());
+        User32Ex.INSTANCE.RegisterRawInputDevices(devices, 1, devices[0].size());
     }
 
-    /**
-     * Reads the raw memory buffer from Windows and extracts mouse movement and button states
-     * @param lParam The Win32 pointer to the raw input data
-     */
     private void handleRawInput(LPARAM lParam) {
-        if (!this.running) return;
-        pcbSize[0] = (int) this.inputBuffer.size();
+        if (!this.running || !this.windowFocused || this.focusTimer > 0) return;
 
-        if (User32Ex.GetRawInputData(lParam.longValue(), Win32.RID_INPUT, this.inputBuffer, pcbSize, RAW_INPUT_HEADER_SIZE) > 0) {
-            int type = this.inputBuffer.getInt(0); //dwType
+        this.pcbSize.setValue(INPUT_BUFFER_SIZE);
+        WinNT.HANDLE hRawInput = new WinNT.HANDLE(new Pointer(lParam.longValue()));
 
-            if (type == Win32.RIM_TYPEMOUSE) {
-                short flags = this.inputBuffer.getShort(24);
+        if (User32Ex.INSTANCE.GetRawInputData(hRawInput, RID_INPUT, this.inputBuffer, this.pcbSize, HEADER_SIZE) > 0) {
+            int type = this.inputBuffer.getInt(0);
 
-                if ((flags & Win32.MOUSE_MOVE_ABSOLUTE) == 0) {
-                    int lastX = this.inputBuffer.getInt(36); //lLastX
-                    int lastY = this.inputBuffer.getInt(40); //lLastY
+            if (type == RIM_TYPEMOUSE) {
+                short flags = this.inputBuffer.getShort(FLAGS_OFFSET);
 
-                    if (lastX != 0) {
-                        this.deltaX.addAndGet(lastX);
-                    }
+                if ((flags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                    int lastX = this.inputBuffer.getInt(LAST_X_OFFSET);
+                    int lastY = this.inputBuffer.getInt(LAST_Y_OFFSET);
 
-                    if (lastY != 0) {
-                        this.deltaY.addAndGet(lastY);
+                    if (lastX != 0 || lastY != 0) {
+                        if (lastX != 0) {
+                            this.deltaX.addAndGet(lastX);
+                        }
+                        if (lastY != 0) {
+                            this.deltaY.addAndGet(lastY);
+                        }
+
+                        if (this.gameFocused) {
+                            this.centerSystemCursor();
+                        }
                     }
                 }
 
-                int buttonData = this.inputBuffer.getInt(28); //ulButtons
-                int buttonFlags = buttonData & Win32.BUTTON_FLAGS_MASK;
+                int buttonFlags = this.inputBuffer.getShort(BUTTON_FLAGS_OFFSET) & 0xFFFF;
+                short buttonData = this.inputBuffer.getShort(BUTTON_DATA_OFFSET);
 
-                if (buttonFlags != 0) {
+                if (buttonFlags != 0 && this.gameFocused) {
                     this.handleButtons(buttonFlags);
                     this.handleScroll(buttonData, buttonFlags);
                 }
@@ -159,103 +186,122 @@ public class RawInputHandler implements AutoCloseable {
         }
     }
 
-    /**
-     * Maps raw button state flags to GLFW actions and schedules them for the main thread.
-     * @param buttonFlags The bitmask of mouse button states
-     */
     private void handleButtons(int buttonFlags) {
-        for (short i = 0; i < Win32.BUTTON_MAP.length; i++) {
-            if ((buttonFlags & Win32.BUTTON_MAP[i][0]) != 0) {
+        for (int i = 0; i < BUTTON_MAP.length; i++) {
+            if ((buttonFlags & BUTTON_MAP[i][0]) != 0) {
                 this.triggerButtonEvent(i, GLFW.GLFW_PRESS);
-            } else if ((buttonFlags & Win32.BUTTON_MAP[i][1]) != 0) {
+            } else if ((buttonFlags & BUTTON_MAP[i][1]) != 0) {
                 this.triggerButtonEvent(i, GLFW.GLFW_RELEASE);
             }
         }
     }
 
-    /**
-     * Extracts and normalizes scroll wheel delta
-     * @param buttonData The raw button data containing scroll information
-     * @param buttonFlags
-     */
-    private void handleScroll(int buttonData, int buttonFlags) {
-        if ((buttonFlags & Win32.RI_MOUSE_WHEEL) != 0) {
-            short wheelDelta = (short) (buttonData >> Win32.WHEEL_DATA_SHIFT);
-            double normalizedDelta = (double) wheelDelta / Win32.WHEEL_DELTA_UNIT;
+    private void handleScroll(short buttonData, int buttonFlags) {
+        if ((buttonFlags & RI_MOUSE_WHEEL) != 0) {
+            double normalizedDelta = buttonData / WHEEL_DELTA_UNIT;
             if (this.scrollCallback != null) {
                 this.mainThreadEventQueue.add(() -> this.scrollCallback.accept(this.glfwWindowHandle, 0.0, normalizedDelta));
             }
         }
     }
 
-    /**
-     * Pushes button events to the Minecraft main thread via the callback
-     */
     private void triggerButtonEvent(int buttonId, int action) {
         if (this.buttonCallback != null) {
             this.mainThreadEventQueue.add(() -> this.buttonCallback.accept(this.glfwWindowHandle, new MouseInput(buttonId, 0), action));
         }
     }
 
-    /**
-     * Executes all queued button and scroll events to Minecraft's main thread
-     */
-    public void processQueuedEvents() {
+    public void flushEvents(boolean process) {
         Runnable task;
         while ((task = mainThreadEventQueue.poll()) != null) {
-            task.run();
+            if (process) {
+                task.run();
+            }
         }
     }
 
-    /**
-     * Returns and resets the accumulated horizontal movement
-     */
     public double pollDeltaX() {
-        if (this.deltaX.get() != 0) {
-            return this.deltaX.getAndSet(0);
-        }
-        return 0.0;
+        return this.deltaX.getAndSet(0);
     }
 
-    /**
-     * Returns and resets the accumulated vertical movement
-     */
     public double pollDeltaY() {
-        if (this.deltaY.get() != 0) {
-            return this.deltaY.getAndSet(0);
-        }
-        return 0.0;
+        return this.deltaY.getAndSet(0);
     }
-
 
     public boolean isRunning() {
         return this.running;
     }
 
-    /**
-     * Cleans up the native window, unregisters the raw input device, and shuts down the handler
-     */
+    public void onWindowFocusChanged(boolean focused) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (!focused) {
+            client.mouse.unlockCursor();
+            this.deltaX.set(0);
+            this.deltaY.set(0);
+            this.gameFocused = false;
+            this.windowFocused = false;
+        } else {
+            if (client.currentScreen == null) {
+                this.focusTimer = FOCUS_DELAY;
+            }
+        }
+    }
+
+    public void tick() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        this.windowFocused = client.isWindowFocused();
+        this.gameFocused = client.currentScreen == null;
+
+        Window window = client.getWindow();
+        if (window != null) {
+            this.windowCenterX = window.getX() + (window.getWidth() / 2);
+            this.windowCenterY = window.getY() + (window.getHeight() / 2);
+        }
+
+        if (this.focusTimer > 0) {
+            this.focusTimer--;
+
+            if (this.focusTimer == 0) {
+                client.execute(client.mouse::lockCursor);
+            }
+        }
+    }
+
+    private void centerSystemCursor() {
+        if (this.windowCenterX != 0 || this.windowCenterY != 0) {
+            User32.INSTANCE.SetCursorPos(this.windowCenterX, this.windowCenterY);
+        }
+    }
+
     @Override
     public void close() {
-        if (!IS_WINDOWS) return;
+        if (!IS_WINDOWS || !this.running) return;
         this.running = false;
+
         if (this.rawInputTargetHwnd != null) {
-            User32Ex.RAWINPUTDEVICE device = new User32Ex.RAWINPUTDEVICE();
-            device.usUsagePage = Win32.HID_USAGE_PAGE_GENERIC;
-            device.usUsage = Win32.HID_USAGE_MOUSE;
-            device.dwFlags = Win32.RIDEV_REMOVE;
-            device.hwndTarget = null;
+            User32Ex.RAWINPUTDEVICE[] devices = (User32Ex.RAWINPUTDEVICE[]) new User32Ex.RAWINPUTDEVICE().toArray(1);
+            devices[0].usUsagePage = 0x01;
+            devices[0].usUsage = 0x02;
+            devices[0].dwFlags = RIDEV_REMOVE;
+            devices[0].hwndTarget = null;
+            User32Ex.INSTANCE.RegisterRawInputDevices(devices, 1, devices[0].size());
 
-            device.write();
-            User32Ex.RegisterRawInputDevices(device.getPointer(), 1, device.size());
+            User32.INSTANCE.PostMessage(this.rawInputTargetHwnd, WM_USER, new WPARAM(0), new LPARAM(0));
+        }
+    }
 
-            User32.INSTANCE.PostMessage(this.rawInputTargetHwnd, WinUser.WM_CLOSE, null, null);
-            User32.INSTANCE.DestroyWindow(this.rawInputTargetHwnd);
-            this.rawInputTargetHwnd = null;
+    private interface User32Ex extends StdCallLibrary {
+        User32Ex INSTANCE = Native.load("user32", User32Ex.class, W32APIOptions.DEFAULT_OPTIONS);
+
+        @Structure.FieldOrder({"usUsagePage", "usUsage", "dwFlags", "hwndTarget"})
+        class RAWINPUTDEVICE extends Structure {
+            public short usUsagePage;
+            public short usUsage;
+            public int dwFlags;
+            public HWND hwndTarget;
         }
 
-        if (this.glfwWindowHandle != 0) {
-            User32.INSTANCE.UnregisterClass(glfwWindowHandle + "_", null);
-        }
+        boolean RegisterRawInputDevices(RAWINPUTDEVICE[] pRawInputDevices, int uiNumDevices, int cbSize);
+        int GetRawInputData(WinNT.HANDLE hRawInput, int uiCommand, Pointer pData, IntByReference pcbSize, int cbSizeHeader);
     }
 }
