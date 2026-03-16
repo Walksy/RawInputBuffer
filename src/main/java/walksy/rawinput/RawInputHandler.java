@@ -58,7 +58,7 @@ public class RawInputHandler implements AutoCloseable {
     private String windowClassName;
     private TriConsumer<Long, MouseInput, Integer> buttonCallback;
     private TriConsumer<Long, Double, Double> scrollCallback;
-    private int focusTimer;
+    private final AtomicInteger focusTimer;
     private volatile boolean running;
     private volatile boolean windowFocused;
     private volatile boolean gameFocused;
@@ -69,7 +69,7 @@ public class RawInputHandler implements AutoCloseable {
         this.deltaX = new AtomicInteger(0);
         this.deltaY = new AtomicInteger(0);
         this.running = false;
-        this.focusTimer = 0;
+        this.focusTimer = new AtomicInteger(0);
         this.inputBuffer = new Memory(INPUT_BUFFER_SIZE);
         this.pcbSize = new IntByReference(INPUT_BUFFER_SIZE);
         this.mainThreadEventQueue = new ConcurrentLinkedQueue<>();
@@ -146,7 +146,7 @@ public class RawInputHandler implements AutoCloseable {
     }
 
     private void handleRawInput(LPARAM lParam) {
-        if (!this.running || !this.windowFocused || this.focusTimer > 0) return;
+        if (!this.running || !this.windowFocused || this.focusTimer.get() > 0) return;
 
         this.pcbSize.setValue(INPUT_BUFFER_SIZE);
         WinNT.HANDLE hRawInput = new WinNT.HANDLE(new Pointer(lParam.longValue()));
@@ -178,7 +178,7 @@ public class RawInputHandler implements AutoCloseable {
                 int buttonFlags = this.inputBuffer.getShort(BUTTON_FLAGS_OFFSET) & 0xFFFF;
                 short buttonData = this.inputBuffer.getShort(BUTTON_DATA_OFFSET);
 
-                if (buttonFlags != 0 && this.gameFocused) {
+                if (buttonFlags != 0) {
                     this.handleButtons(buttonFlags);
                     this.handleScroll(buttonData, buttonFlags);
                 }
@@ -190,7 +190,8 @@ public class RawInputHandler implements AutoCloseable {
         for (int i = 0; i < BUTTON_MAP.length; i++) {
             if ((buttonFlags & BUTTON_MAP[i][0]) != 0) {
                 this.triggerButtonEvent(i, GLFW.GLFW_PRESS);
-            } else if ((buttonFlags & BUTTON_MAP[i][1]) != 0) {
+            }
+            if ((buttonFlags & BUTTON_MAP[i][1]) != 0) {
                 this.triggerButtonEvent(i, GLFW.GLFW_RELEASE);
             }
         }
@@ -242,7 +243,7 @@ public class RawInputHandler implements AutoCloseable {
             this.windowFocused = false;
         } else {
             if (client.currentScreen == null) {
-                this.focusTimer = FOCUS_DELAY;
+                this.focusTimer.set(FOCUS_DELAY);
             }
         }
     }
@@ -258,10 +259,8 @@ public class RawInputHandler implements AutoCloseable {
             this.windowCenterY = window.getY() + (window.getHeight() / 2);
         }
 
-        if (this.focusTimer > 0) {
-            this.focusTimer--;
-
-            if (this.focusTimer == 0) {
+        if (this.focusTimer.get() > 0) {
+            if (this.focusTimer.decrementAndGet() == 0) {
                 client.execute(client.mouse::lockCursor);
             }
         }

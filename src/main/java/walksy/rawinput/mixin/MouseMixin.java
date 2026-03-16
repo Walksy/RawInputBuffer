@@ -62,8 +62,10 @@ public abstract class MouseMixin {
         if (inputHandler.isRunning()) {
             inputHandler.flushEvents(!this.shouldProcessGlfw());
 
-            this.cursorDeltaX = inputHandler.pollDeltaX();
-            this.cursorDeltaY = inputHandler.pollDeltaY();
+            if (!this.shouldProcessGlfw()) {
+                this.cursorDeltaX = inputHandler.pollDeltaX();
+                this.cursorDeltaY = inputHandler.pollDeltaY();
+            }
         }
     }
 
