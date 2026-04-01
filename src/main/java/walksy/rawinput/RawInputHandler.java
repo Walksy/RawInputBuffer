@@ -1,5 +1,6 @@
 package walksy.rawinput;
 
+import com.mojang.blaze3d.platform.Window;
 import com.sun.jna.Memory;
 import com.sun.jna.Native;
 import com.sun.jna.Pointer;
@@ -14,13 +15,12 @@ import com.sun.jna.platform.win32.WinUser.WindowProc;
 import com.sun.jna.ptr.IntByReference;
 import com.sun.jna.win32.StdCallLibrary;
 import com.sun.jna.win32.W32APIOptions;
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.util.Window;
 import org.apache.logging.log4j.util.TriConsumer;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.client.Minecraft;
 
 public class RawInputHandler implements AutoCloseable {
     private static final boolean IS_WINDOWS = System.getProperty("os.name").toLowerCase().contains("win");
@@ -234,34 +234,34 @@ public class RawInputHandler implements AutoCloseable {
     }
 
     public void onWindowFocusChanged(boolean focused) {
-        MinecraftClient client = MinecraftClient.getInstance();
+        Minecraft client = Minecraft.getInstance();
         if (!focused) {
-            client.mouse.unlockCursor();
+            client.mouseHandler.releaseMouse();
             this.deltaX.set(0);
             this.deltaY.set(0);
             this.gameFocused = false;
             this.windowFocused = false;
         } else {
-            if (client.currentScreen == null) {
+            if (client.screen == null) {
                 this.focusTimer.set(FOCUS_DELAY);
             }
         }
     }
 
     public void tick() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        this.windowFocused = client.isWindowFocused();
-        this.gameFocused = client.currentScreen == null;
+        Minecraft client = Minecraft.getInstance();
+        this.windowFocused = client.isWindowActive();
+        this.gameFocused = client.screen == null;
 
         Window window = client.getWindow();
         if (window != null) {
-            this.windowCenterX = window.getX() + (window.getWidth() / 2);
-            this.windowCenterY = window.getY() + (window.getHeight() / 2);
+            this.windowCenterX = window.getX() + (window.getScreenWidth() / 2);
+            this.windowCenterY = window.getY() + (window.getScreenHeight() / 2);
         }
 
         if (this.focusTimer.get() > 0) {
             if (this.focusTimer.decrementAndGet() == 0) {
-                client.execute(client.mouse::lockCursor);
+                client.execute(client.mouseHandler::grabMouse);
             }
         }
     }

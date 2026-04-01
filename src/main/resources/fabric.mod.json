@@ -25,9 +25,9 @@
 	],
 	"depends": {
 		"fabricloader": "*",
-		"minecraft": "*",
-		"java": ">=17",
+		"minecraft": ">=26.1",
+		"java": ">=25",
 		"fabric-api": "*",
-		"walksylib": ">=0.9.95"
+		"walksylib": ">=1.0.2"
 	}
 }
