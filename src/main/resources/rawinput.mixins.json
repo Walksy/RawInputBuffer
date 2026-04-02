@@ -3,9 +3,9 @@
 	"package": "walksy.rawinput.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"client": [
-		"MouseMixin",
+		"MouseHandlerMixin",
 		"WindowMixin",
-		"MinecraftClientMixin"
+      "MinecraftMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

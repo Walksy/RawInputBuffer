@@ -9,7 +9,7 @@ import walksy.rawinput.RawInput;
 import walksy.rawinput.RawInputHandler;
 
 @Mixin(Minecraft.class)
-public class MinecraftClientMixin {
+public class MinecraftMixin {
 
     @Inject(method = "tick", at = @At("HEAD"))
     public void tick(CallbackInfo ci) {

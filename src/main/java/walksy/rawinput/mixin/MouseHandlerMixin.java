@@ -1,5 +1,6 @@
 package walksy.rawinput.mixin;
 
+import net.minecraft.client.input.MouseButtonInfo;
 import org.apache.logging.log4j.util.TriConsumer;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWDropCallback;
@@ -23,8 +24,15 @@ import java.util.List;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.MouseHandler;
 
+/**
+ * Redirects {@link MouseHandler} input handling to {@link RawInputHandler} (when {@link RawInputHandler#isRunning()} is true).
+ * <p>
+ * GLFW mouse constants are replaced with a set that only fires when a screen is open.
+ * Delta movement, button presses and scroll inputs are sourced exclusively from the raw input thread and applied each frame in
+ * {@link #handleAccumulatedMovement(CallbackInfo)}.
+ */
 @Mixin(MouseHandler.class)
-public abstract class MouseMixin {
+public abstract class MouseHandlerMixin {
 
     @Shadow private double accumulatedDY;
     @Shadow private double accumulatedDX;
@@ -35,6 +43,7 @@ public abstract class MouseMixin {
     @Shadow protected abstract void onDrop(long window, List<Path> paths, int invalidFilesCount);
     @Shadow protected abstract void onButton(long window, net.minecraft.client.input.MouseButtonInfo input, int action);
 
+    /** Bridges raw input button events into {@link MouseHandler#onButton(long, MouseButtonInfo, int)}. */
     @Unique
     private final TriConsumer<Long, MouseInput, Integer> MOUSE_BUTTON_CALLBACK = (windowx, input, action) -> {
         this.onButton(windowx, new net.minecraft.client.input.MouseButtonInfo(input.button(), input.modifiers()), action);
@@ -43,19 +52,27 @@ public abstract class MouseMixin {
     @Unique
     private final TriConsumer<Long, Double, Double> MOUSE_SCROLL_CALLBACK = this::onScroll;
 
+    /**
+     * Initializes and replaces the default GLFW setup with the raw input hand;er
+     */
     @Inject(method = "setup", at = @At("HEAD"), cancellable = true)
     private void setup(Window window, CallbackInfo ci) {
         RawInputHandler inputHandler = RawInput.getInputHandler();
         if (inputHandler.initialize(window.handle(), MOUSE_BUTTON_CALLBACK, MOUSE_SCROLL_CALLBACK)) {
             this.setupGlfw(window.handle());
-            ci.cancel();
+            ci.cancel(); //cancels the default GLFW constants
         }
     }
 
+    /**
+     * Called every frame. Flushes queued input events and, when in-game,
+     * writes raw deltas into the accumulated movement fields.
+     */
     @Inject(method = "handleAccumulatedMovement", at = @At("HEAD"))
-    public void tick(CallbackInfo ci) {
+    public void handleAccumulatedMovement(CallbackInfo ci) {
         RawInputHandler inputHandler = RawInput.getInputHandler();
         if (inputHandler.isRunning()) {
+            //events are still consumed no matter what to prevent a build up of inputs which will later get consumed
             inputHandler.flushEvents(!this.shouldProcessGlfw());
 
             if (!this.shouldProcessGlfw()) {
@@ -65,6 +82,7 @@ public abstract class MouseMixin {
         }
     }
 
+    /** Enables exclusive (no-legacy) raw input when the mouse is grabbed. */
     @Inject(method = "grabMouse", at = @At("HEAD"))
     public void onLockCursor(CallbackInfo ci) {
         RawInputHandler inputHandler = RawInput.getInputHandler();
@@ -73,6 +91,7 @@ public abstract class MouseMixin {
         }
     }
 
+    /** Restores standard raw input sink mode when the mouse is released. */
     @Inject(method = "releaseMouse", at = @At("HEAD"))
     public void onUnlockCursor(CallbackInfo ci) {
         RawInputHandler inputHandler = RawInput.getInputHandler();
@@ -81,6 +100,12 @@ public abstract class MouseMixin {
         }
     }
 
+    /**
+     * Registers GLFW callbacks which only fire when a screen is open.
+     * Movement, buttons, scroll, and file drop are all covered.
+     *
+     * @param window the GLFW window handle
+     */
     @Unique
     private void setupGlfw(long window) {
         GLFW.glfwSetCursorPosCallback(window, (windowx, x, y) -> {
@@ -120,6 +145,9 @@ public abstract class MouseMixin {
         });
     }
 
+    /**
+     * @return {@code true} when a screen is open
+     */
     @Unique
     private boolean shouldProcessGlfw() {
         return this.minecraft.screen != null;
