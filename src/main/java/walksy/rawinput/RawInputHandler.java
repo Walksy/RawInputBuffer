@@ -319,6 +319,14 @@ public class RawInputHandler implements AutoCloseable {
     }
 
     /**
+     * Resets accumulated deltas
+     */
+    public void resetDeltas() {
+        this.deltaX.set(0);
+        this.deltaY.set(0);
+    }
+
+    /**
      * @return {@code true} if the input thread is active
      */
     public boolean isRunning() {
@@ -336,8 +344,7 @@ public class RawInputHandler implements AutoCloseable {
         Minecraft client = Minecraft.getInstance();
         if (!focused) {
             client.mouseHandler.releaseMouse();
-            this.deltaX.set(0);
-            this.deltaY.set(0);
+            this.resetDeltas();
             this.gameFocused = false;
             this.windowFocused = false;
         } else {

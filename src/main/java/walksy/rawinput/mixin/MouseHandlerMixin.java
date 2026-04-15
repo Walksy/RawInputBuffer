@@ -41,7 +41,7 @@ public abstract class MouseHandlerMixin {
     @Shadow protected abstract void onScroll(long window, double horizontal, double vertical);
     @Shadow protected abstract void onMove(long window, double x, double y);
     @Shadow protected abstract void onDrop(long window, List<Path> paths, int invalidFilesCount);
-    @Shadow protected abstract void onButton(long window, net.minecraft.client.input.MouseButtonInfo input, int action);
+    @Shadow protected abstract void onButton(long window, MouseButtonInfo input, int action);
 
     /** Bridges raw input button events into {@link MouseHandler#onButton(long, MouseButtonInfo, int)}. */
     @Unique
