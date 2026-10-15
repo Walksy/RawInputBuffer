@@ -27,7 +27,7 @@ import net.minecraft.client.MouseHandler;
 /**
  * Redirects {@link MouseHandler} input handling to {@link RawInputHandler} (when {@link RawInputHandler#isRunning()} is true).
  * <p>
- * GLFW mouse constants are replaced with a set that only fires when a screen is open.
+ * GLFW mouse callbacks are forwarded while a screen or an external editor owns input.
  * Delta movement, button presses and scroll inputs are sourced exclusively from the raw input thread and applied each frame in
  * {@link #handleAccumulatedMovement(CallbackInfo)}.
  */
@@ -146,10 +146,10 @@ public abstract class MouseHandlerMixin {
     }
 
     /**
-     * @return {@code true} when a screen is open
+     * @return {@code true} when a screen or an external editor owns mouse input
      */
     @Unique
     private boolean shouldProcessGlfw() {
-        return this.minecraft.screen != null;
+        return RawInput.getInputHandler().hasExternalMouseOwner() || this.minecraft.screen != null;
     }
 }

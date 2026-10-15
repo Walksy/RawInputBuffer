@@ -5,6 +5,7 @@
 	"client": [
 		"MouseHandlerMixin",
 		"WindowMixin",
+        "compat.FlashbackReplayUIMixin",
       "MinecraftMixin"
 	],
 	"injectors": {

@@ -95,6 +95,9 @@ public class RawInputHandler implements AutoCloseable {
     /** Whether the player is in-game with no screen open. */
     private volatile boolean gameFocused;
 
+    /** An editor with its own GLFW callbacks currently owns mouse input. */
+    private volatile boolean externalMouseOwner;
+
     private volatile int windowCenterX;
     private volatile int windowCenterY;
 
@@ -185,6 +188,7 @@ public class RawInputHandler implements AutoCloseable {
      */
     public void setLegacy(boolean exclusive) {
         if (this.rawInputTargetHwnd == null) return;
+        exclusive = exclusive && !this.externalMouseOwner;
 
         User32Ex.RAWINPUTDEVICE[] devices = (User32Ex.RAWINPUTDEVICE[]) new User32Ex.RAWINPUTDEVICE().toArray(1);
         devices[0].usUsagePage = 0x01;
@@ -201,7 +205,7 @@ public class RawInputHandler implements AutoCloseable {
      * @param lParam the {@code LPARAM} from the raw input message, used as the input handle
      */
     private void handleRawInput(LPARAM lParam) {
-        if (!this.running || !this.windowFocused || this.focusTimer.get() > 0) return;
+        if (!this.running || !this.windowFocused || this.externalMouseOwner || this.focusTimer.get() > 0) return;
 
         this.pcbSize.setValue(INPUT_BUFFER_SIZE);
         WinNT.HANDLE hRawInput = new WinNT.HANDLE(new Pointer(lParam.longValue()));
@@ -333,6 +337,23 @@ public class RawInputHandler implements AutoCloseable {
         return this.running;
     }
 
+    public boolean hasExternalMouseOwner() {
+        return this.externalMouseOwner;
+    }
+
+    /** Hands the complete GLFW event stream back to editors such as Flashback. */
+    public void setExternalMouseOwner(boolean externalMouseOwner) {
+        if (this.externalMouseOwner == externalMouseOwner) return;
+        this.externalMouseOwner = externalMouseOwner;
+        this.resetDeltas();
+        this.flushEvents(false);
+        if (externalMouseOwner) {
+            this.gameFocused = false;
+            this.focusTimer.set(0);
+            this.setLegacy(false);
+        }
+    }
+
     /**
      * Called via {@link Window} when the game window loses or gains focus
      * <p>
@@ -348,7 +369,7 @@ public class RawInputHandler implements AutoCloseable {
             this.gameFocused = false;
             this.windowFocused = false;
         } else {
-            if (client.screen == null) {
+            if (client.screen == null && !this.externalMouseOwner) {
                 this.focusTimer.set(FOCUS_DELAY);
             }
         }
@@ -360,7 +381,7 @@ public class RawInputHandler implements AutoCloseable {
     public void tick() {
         Minecraft client = Minecraft.getInstance();
         this.windowFocused = client.isWindowActive();
-        this.gameFocused = client.screen == null;
+        this.gameFocused = client.screen == null && !this.externalMouseOwner;
 
         Window window = client.getWindow();
         if (window != null) {
