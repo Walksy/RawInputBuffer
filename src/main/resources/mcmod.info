@@ -1,0 +1,14 @@
+[
+  {
+    "modid": "rawinputbuffer",
+    "name": "Raw Input Buffer",
+    "description": "Windows raw mouse input on a dedicated thread for Minecraft 1.8.9.",
+    "version": "${version}",
+    "mcversion": "1.8.9",
+    "url": "https://github.com/LucasLeao18/RawInputBuffer",
+    "authorList": ["Walksy", "LucasLeao18 (Forge 1.8.9 port)"],
+    "credits": "Original RawInputBuffer by Walksy, MIT license.",
+    "logoFile": "assets/walksy/icon.png",
+    "dependencies": []
+  }
+]

@@ -1,71 +1,54 @@
-plugins {
-    id 'net.fabricmc.fabric-loom' version '1.15-SNAPSHOT'
-    id 'maven-publish'
-}
+plugins { id 'java' }
 
-version = project.mod_version
-group = project.maven_group
-
-base {
-    archivesName = project.archives_base_name
-}
+group = 'walksy.rawinputbuffer'
+version = '1.1.0+1.8.9'
+base.archivesName = 'RawInputBuffer-Forge'
 
 repositories {
-    maven { url = "https://api.modrinth.com/maven" }
+    mavenCentral()
+    maven { url = 'https://maven.minecraftforge.net' }
+    maven { url = 'https://libraries.minecraft.net' }
 }
+
+configurations { lwjglNatives }
 
 dependencies {
-    minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
-
-    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
-    implementation("maven.modrinth:walksylib:${project.walksylib_version}")
-
-    implementation 'net.java.dev.jna:jna:5.14.0'
-    implementation 'net.java.dev.jna:jna-platform:5.14.0'
-}
-
-processResources {
-    inputs.property "version", project.version
-
-    filesMatching("fabric.mod.json") {
-        expand "version": project.version
-    }
+    // Only Forge and LWJGL symbols: no MCP workspace or reobfuscation required.
+    compileOnly 'net.minecraftforge:forge:1.8.9-11.15.1.2318-1.8.9:universal@jar'
+    compileOnly 'com.google.guava:guava:17.0'
+    compileOnly 'org.lwjgl.lwjgl:lwjgl:2.9.4-nightly-20150209'
+    compileOnly 'net.java.dev.jna:jna:3.4.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.lwjgl.lwjgl:lwjgl:2.9.4-nightly-20150209'
+    testImplementation 'net.java.dev.jna:jna:3.4.0'
+    lwjglNatives 'org.lwjgl.lwjgl:lwjgl-platform:2.9.4-nightly-20150209:natives-windows'
 }
 
 tasks.withType(JavaCompile).configureEach {
-    it.options.release = 25
+    options.release = 8
+    options.encoding = 'UTF-8'
+}
+java { withSourcesJar() }
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('mcmod.info') { expand(version: project.version) }
+}
+def extractTestNatives = tasks.register('extractTestNatives', Copy) {
+    from { configurations.lwjglNatives.collect { zipTree(it) } }
+    include '*.dll'
+    into layout.buildDirectory.dir('test-natives')
 }
 
-java {
-    // Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
-    // if it is present.
-    // If you remove this line, sources will not be generated.
-    withSourcesJar()
-
-    sourceCompatibility = JavaVersion.VERSION_25
-    targetCompatibility = JavaVersion.VERSION_25
+test {
+    dependsOn extractTestNatives
+    systemProperty 'org.lwjgl.librarypath', layout.buildDirectory.dir('test-natives').get().asFile.absolutePath
+    if (project.hasProperty('testJavaHome')) {
+        executable = "${project.property('testJavaHome')}/bin/java.exe"
+    }
+    testLogging { events 'passed', 'skipped', 'failed' }
 }
-
 jar {
-    from("LICENSE") {
-        rename { "${it}_${project.base.archivesName.get()}"}
-    }
-}
-
-// configure the maven publication
-publishing {
-    publications {
-        mavenJava(MavenPublication) {
-            from components.java
-        }
-    }
-
-    // See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
-    repositories {
-        // Add repositories to publish to here.
-        // Notice: This block does NOT have the same function as the block in the top level.
-        // The repositories here will be used for publishing your artifact, not for
-        // retrieving dependencies.
-    }
+    from('LICENSE')
+    manifest.attributes('Implementation-Title': 'Raw Input Buffer (Forge 1.8.9)',
+                        'Implementation-Version': project.version)
 }
