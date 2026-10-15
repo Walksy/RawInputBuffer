@@ -27,9 +27,9 @@ import net.minecraft.client.MouseHandler;
 /**
  * Redirects {@link MouseHandler} input handling to {@link RawInputHandler} (when {@link RawInputHandler#isRunning()} is true).
  * <p>
- * GLFW mouse constants are replaced with a set that only fires when a screen is open.
- * Delta movement, button presses and scroll inputs are sourced exclusively from the raw input thread and applied each frame in
- * {@link #handleAccumulatedMovement(CallbackInfo)}.
+ * Focused input is buffered on the native thread, including while screens are open.
+ * Screen cursor movement is sampled once per frame; clicks and scroll retain their
+ * own cursor positions. GLFW callbacks remain available when native buffering is inactive.
  */
 @Mixin(MouseHandler.class)
 public abstract class MouseHandlerMixin {
@@ -42,6 +42,7 @@ public abstract class MouseHandlerMixin {
     @Shadow protected abstract void onMove(long window, double x, double y);
     @Shadow protected abstract void onDrop(long window, List<Path> paths, int invalidFilesCount);
     @Shadow protected abstract void onButton(long window, MouseButtonInfo input, int action);
+    @Shadow private boolean mouseGrabbed;
 
     /** Bridges raw input button events into {@link MouseHandler#onButton(long, MouseButtonInfo, int)}. */
     @Unique
@@ -52,57 +53,57 @@ public abstract class MouseHandlerMixin {
     @Unique
     private final TriConsumer<Long, Double, Double> MOUSE_SCROLL_CALLBACK = this::onScroll;
 
+    @Unique
+    private final TriConsumer<Long, Double, Double> MOUSE_CURSOR_CALLBACK = (window, x, y) -> {
+        if (this.minecraft.screen != null) this.onMove(window, x, y);
+    };
+
     /**
      * Initializes and replaces the default GLFW setup with the raw input hand;er
      */
     @Inject(method = "setup", at = @At("HEAD"), cancellable = true)
     private void setup(Window window, CallbackInfo ci) {
         RawInputHandler inputHandler = RawInput.getInputHandler();
-        if (inputHandler.initialize(window.handle(), MOUSE_BUTTON_CALLBACK, MOUSE_SCROLL_CALLBACK)) {
+        if (inputHandler.initialize(window.handle(), MOUSE_BUTTON_CALLBACK, MOUSE_SCROLL_CALLBACK, MOUSE_CURSOR_CALLBACK)) {
             this.setupGlfw(window.handle());
             ci.cancel(); //cancels the default GLFW constants
         }
     }
 
     /**
-     * Called every frame. Flushes queued input events and, when in-game,
-     * writes raw deltas into the accumulated movement fields.
+     * Flushes queued events, samples screen cursor movement, or supplies camera deltas.
      */
     @Inject(method = "handleAccumulatedMovement", at = @At("HEAD"))
     public void handleAccumulatedMovement(CallbackInfo ci) {
         RawInputHandler inputHandler = RawInput.getInputHandler();
         if (inputHandler.isRunning()) {
             //events are still consumed no matter what to prevent a build up of inputs which will later get consumed
-            inputHandler.flushEvents(!this.shouldProcessGlfw());
+            inputHandler.flushEvents(inputHandler.isBufferingInput());
 
-            if (!this.shouldProcessGlfw()) {
-                this.accumulatedDX = inputHandler.pollDeltaX();
-                this.accumulatedDY = inputHandler.pollDeltaY();
+            if (inputHandler.isBufferingInput()) {
+                if (this.minecraft.screen != null) {
+                    inputHandler.updateCursorPosition();
+                    inputHandler.resetDeltas();
+                } else {
+                    this.accumulatedDX = inputHandler.pollDeltaX();
+                    this.accumulatedDY = inputHandler.pollDeltaY();
+                }
             }
         }
     }
 
-    /** Enables exclusive (no-legacy) raw input when the mouse is grabbed. */
-    @Inject(method = "grabMouse", at = @At("HEAD"))
-    public void onLockCursor(CallbackInfo ci) {
+    /** Re-register after GLFW changes cursor mode, including when opening a screen. */
+    @Inject(method = {"grabMouse", "releaseMouse"}, at = @At("TAIL"))
+    public void onCursorModeChanged(CallbackInfo ci) {
         RawInputHandler inputHandler = RawInput.getInputHandler();
         if (inputHandler.isRunning()) {
-            inputHandler.setLegacy(true);
-        }
-    }
-
-    /** Restores standard raw input sink mode when the mouse is released. */
-    @Inject(method = "releaseMouse", at = @At("HEAD"))
-    public void onUnlockCursor(CallbackInfo ci) {
-        RawInputHandler inputHandler = RawInput.getInputHandler();
-        if (inputHandler.isRunning()) {
-            inputHandler.setLegacy(false);
+            inputHandler.updateMouseState(this.minecraft.isWindowActive(), this.mouseGrabbed);
         }
     }
 
     /**
-     * Registers GLFW callbacks which only fire when a screen is open.
-     * Movement, buttons, scroll, and file drop are all covered.
+     * Registers fallback GLFW callbacks when native buffering is inactive.
+     * File drops continue through GLFW regardless of the mouse input source.
      *
      * @param window the GLFW window handle
      */
@@ -146,10 +147,10 @@ public abstract class MouseHandlerMixin {
     }
 
     /**
-     * @return {@code true} when a screen is open
+     * @return {@code true} when native buffering is not handling the event stream
      */
     @Unique
     private boolean shouldProcessGlfw() {
-        return this.minecraft.screen != null;
+        return !RawInput.getInputHandler().isBufferingInput();
     }
 }

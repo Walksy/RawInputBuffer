@@ -17,6 +17,7 @@ import com.sun.jna.win32.StdCallLibrary;
 import com.sun.jna.win32.W32APIOptions;
 import org.apache.logging.log4j.util.TriConsumer;
 import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWNativeWin32;
 
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -55,6 +56,7 @@ public class RawInputHandler implements AutoCloseable {
     private static final double WHEEL_DELTA_UNIT = 120.0;
     private static final int MOUSE_MOVE_ABSOLUTE = 0x01;
     private static final int RI_MOUSE_WHEEL = 0x0400;
+    private static final int RI_MOUSE_HWHEEL = 0x0800;
 
     /** Button flag pairs: {@code [downFlag, upFlag]} for each of the five mouse buttons. */
     private static final int[][] BUTTON_MAP = {
@@ -80,11 +82,16 @@ public class RawInputHandler implements AutoCloseable {
     private long glfwWindowHandle;
 
     /** Hidden HWND used as the raw input target. */
-    private HWND rawInputTargetHwnd;
+    private volatile HWND rawInputTargetHwnd;
+
+    private HWND gameWindowHwnd;
+    private volatile boolean legacySuppressed;
 
     private String windowClassName;
     private TriConsumer<Long, MouseInput, Integer> buttonCallback;
     private TriConsumer<Long, Double, Double> scrollCallback;
+    private TriConsumer<Long, Double, Double> cursorCallback;
+    private int processedButtons;
 
     //stupid hack fix to prevent the mouse cursor locking before the window even realises it's focused
     private final AtomicInteger focusTimer;
@@ -92,7 +99,7 @@ public class RawInputHandler implements AutoCloseable {
     private volatile boolean running;
     private volatile boolean windowFocused;
 
-    /** Whether the player is in-game with no screen open. */
+    /** Whether the mouse is grabbed in the focused game window. */
     private volatile boolean gameFocused;
 
     private volatile int windowCenterX;
@@ -122,9 +129,12 @@ public class RawInputHandler implements AutoCloseable {
      * @param windowHandle the GLFW window handle to associate events with
      * @param buttonAction callback fired on mouse button press/release {@code (window, input, action)}
      * @param scrollAction callback fired on scroll {@code (window, xDelta, yDelta)}
+     * @param cursorAction callback for client-area cursor positions {@code (window, x, y)}
      * @return {@code true} if initialisation succeeded; {@code false} on non-Windows or if already running
      */
-    public boolean initialize(long windowHandle, TriConsumer<Long, MouseInput, Integer> buttonAction, TriConsumer<Long, Double, Double> scrollAction) {
+    public boolean initialize(long windowHandle, TriConsumer<Long, MouseInput, Integer> buttonAction,
+                              TriConsumer<Long, Double, Double> scrollAction,
+                              TriConsumer<Long, Double, Double> cursorAction) {
         if (!IS_WINDOWS || this.running) {
             return false;
         }
@@ -133,6 +143,8 @@ public class RawInputHandler implements AutoCloseable {
         this.glfwWindowHandle = windowHandle;
         this.buttonCallback = buttonAction;
         this.scrollCallback = scrollAction;
+        this.cursorCallback = cursorAction;
+        this.gameWindowHwnd = new HWND(new Pointer(GLFWNativeWin32.glfwGetWin32Window(windowHandle)));
         this.windowClassName = "RawInputClass_" + this.glfwWindowHandle;
 
         Thread inputThread = new Thread(this::setupRawInputTarget, "Raw-Input-Buffer-Thread");
@@ -192,7 +204,9 @@ public class RawInputHandler implements AutoCloseable {
         devices[0].hwndTarget = this.rawInputTargetHwnd;
         devices[0].dwFlags = exclusive ? (RIDEV_INPUTSINK | RIDEV_NOLEGACY) : RIDEV_INPUTSINK;
 
-        User32Ex.INSTANCE.RegisterRawInputDevices(devices, 1, devices[0].size());
+        if (User32Ex.INSTANCE.RegisterRawInputDevices(devices, 1, devices[0].size())) {
+            this.legacySuppressed = exclusive;
+        }
     }
 
     /**
@@ -201,7 +215,7 @@ public class RawInputHandler implements AutoCloseable {
      * @param lParam the {@code LPARAM} from the raw input message, used as the input handle
      */
     private void handleRawInput(LPARAM lParam) {
-        if (!this.running || !this.windowFocused || this.focusTimer.get() > 0) return;
+        if (!this.isBufferingInput() || this.focusTimer.get() > 0) return;
 
         this.pcbSize.setValue(INPUT_BUFFER_SIZE);
         WinNT.HANDLE hRawInput = new WinNT.HANDLE(new Pointer(lParam.longValue()));
@@ -269,8 +283,12 @@ public class RawInputHandler implements AutoCloseable {
         if ((buttonFlags & RI_MOUSE_WHEEL) != 0) {
             double normalizedDelta = buttonData / WHEEL_DELTA_UNIT;
             if (this.scrollCallback != null) {
-                this.mainThreadEventQueue.add(() -> this.scrollCallback.accept(this.glfwWindowHandle, 0.0, normalizedDelta));
+                this.queueAtCursor(() -> this.scrollCallback.accept(this.glfwWindowHandle, 0.0, normalizedDelta));
             }
+        }
+        if ((buttonFlags & RI_MOUSE_HWHEEL) != 0 && this.scrollCallback != null) {
+            double normalizedDelta = -buttonData / WHEEL_DELTA_UNIT;
+            this.queueAtCursor(() -> this.scrollCallback.accept(this.glfwWindowHandle, normalizedDelta, 0.0));
         }
     }
 
@@ -282,7 +300,78 @@ public class RawInputHandler implements AutoCloseable {
      */
     private void triggerButtonEvent(int buttonId, int action) {
         if (this.buttonCallback != null) {
-            this.mainThreadEventQueue.add(() -> this.buttonCallback.accept(this.glfwWindowHandle, new MouseInput(buttonId, 0), action));
+            MouseInput input = new MouseInput(buttonId, this.readModifiers());
+            this.queueAtCursor(() -> {
+                if (action == GLFW.GLFW_PRESS) this.processedButtons |= 1 << buttonId;
+                else this.processedButtons &= ~(1 << buttonId);
+                this.buttonCallback.accept(this.glfwWindowHandle, input, action);
+            });
+        }
+    }
+
+    private void queueAtCursor(Runnable event) {
+        CursorPosition position = this.readCursorPosition();
+        this.mainThreadEventQueue.add(() -> {
+            this.applyCursorPosition(position);
+            event.run();
+        });
+    }
+
+    /** Samples the OS cursor once per frame instead of forwarding every mouse packet to GLFW. */
+    public void updateCursorPosition() {
+        this.applyCursorPosition(this.readCursorPosition());
+    }
+
+    private void applyCursorPosition(CursorPosition position) {
+        if (position != null && this.cursorCallback != null) {
+            this.cursorCallback.accept(this.glfwWindowHandle, position.x(), position.y());
+        }
+    }
+
+    protected CursorPosition readCursorPosition() {
+        if (this.gameWindowHwnd == null) return null;
+        WinDef.POINT point = new WinDef.POINT();
+        // These are the same screen-to-client coordinates used by GLFW on Windows.
+        if (!User32.INSTANCE.GetCursorPos(point)
+                || !User32Ex.INSTANCE.ScreenToClient(this.gameWindowHwnd, point)) return null;
+        return new CursorPosition(point.x, point.y);
+    }
+
+    protected record CursorPosition(double x, double y) { }
+
+    /** Capture modifiers with the click, before later keyboard events can change them. */
+    protected int readModifiers() {
+        int modifiers = 0;
+        if (isKeyDown(0x10)) modifiers |= GLFW.GLFW_MOD_SHIFT;
+        if (isKeyDown(0x11)) modifiers |= GLFW.GLFW_MOD_CONTROL;
+        if (isKeyDown(0x12)) modifiers |= GLFW.GLFW_MOD_ALT;
+        if (isKeyDown(0x5B) || isKeyDown(0x5C)) modifiers |= GLFW.GLFW_MOD_SUPER;
+        return modifiers;
+    }
+
+    private static boolean isKeyDown(int key) {
+        return (User32.INSTANCE.GetAsyncKeyState(key) & 0x8000) != 0;
+    }
+
+    public boolean isBufferingInput() {
+        return this.running && this.windowFocused && this.legacySuppressed;
+    }
+
+    /** Keep high-rate legacy events off the main thread in both gameplay and screens. */
+    public void updateMouseState(boolean focused, boolean grabbed) {
+        this.windowFocused = focused;
+        this.gameFocused = focused && grabbed;
+        this.setLegacy(focused);
+    }
+
+    /** Release delivered presses when focus loss discards the remaining native events. */
+    public void releaseButtons() {
+        int pressed = this.processedButtons;
+        this.processedButtons = 0;
+        for (int button = 0; button < BUTTON_MAP.length; button++) {
+            if ((pressed & (1 << button)) != 0 && this.buttonCallback != null) {
+                this.buttonCallback.accept(this.glfwWindowHandle, new MouseInput(button, 0), GLFW.GLFW_RELEASE);
+            }
         }
     }
 
@@ -343,11 +432,15 @@ public class RawInputHandler implements AutoCloseable {
     public void onWindowFocusChanged(boolean focused) {
         Minecraft client = Minecraft.getInstance();
         if (!focused) {
+            this.flushEvents(false);
+            this.releaseButtons();
             client.mouseHandler.releaseMouse();
             this.resetDeltas();
             this.gameFocused = false;
             this.windowFocused = false;
+            this.setLegacy(false);
         } else {
+            this.updateMouseState(true, client.mouseHandler.isMouseGrabbed());
             if (client.screen == null) {
                 this.focusTimer.set(FOCUS_DELAY);
             }
@@ -359,8 +452,7 @@ public class RawInputHandler implements AutoCloseable {
      */
     public void tick() {
         Minecraft client = Minecraft.getInstance();
-        this.windowFocused = client.isWindowActive();
-        this.gameFocused = client.screen == null;
+        this.updateMouseState(client.isWindowActive(), client.mouseHandler.isMouseGrabbed());
 
         Window window = client.getWindow();
         if (window != null) {
@@ -409,6 +501,8 @@ public class RawInputHandler implements AutoCloseable {
      */
     private interface User32Ex extends StdCallLibrary {
         User32Ex INSTANCE = Native.load("user32", User32Ex.class, W32APIOptions.DEFAULT_OPTIONS);
+
+        boolean ScreenToClient(HWND hwnd, WinDef.POINT point);
 
         /**
          * Descriptor passed to {@link #RegisterRawInputDevices}.
